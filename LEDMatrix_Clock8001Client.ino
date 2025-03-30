@@ -1,0 +1,952 @@
+/*********************************************************************************************************
+  MatrixClock with Web Interface (Simplified & Fixed Time Display)
+  *********************************************************************************************************
+  Author: HACK Labs / Modified by Adrian Davis / Further Modified: [Your Name]
+  Description:
+    - Removed dynamic scrolling for HH:MM:SS so that time is shown in fixed positions
+      on a 32×8 LED matrix (4 MAX7219 modules).
+    - Uses exactly 7 initialization commands for MAX7219.
+    - No pin reversal logic.
+    - Scrolls the IP address once at startup.
+    - Listens on UDP port 1245 for messages containing
+          "/clock/state,issssiHHMMSS"
+      When such a packet is received, it prints the full packet plus the extracted HHMMSS
+      and updates the RTC.
+*********************************************************************************************************/
+
+#include <SPI.h>
+#include <Ticker.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <time.h>
+#include <EEPROM.h>
+
+// --------------------- Pin Definitions ---------------------
+#define SDA_PIN        5    // I2C SDA
+#define SCL_PIN        4    // I2C SCL
+#define CS_PIN         15   // MAX7219 CS
+#define MATRIX_COUNT   4    // 4 modules (each 8 columns wide = 32 total)
+
+
+// --------------------- Global Objects ---------------------
+Ticker ticker;
+ESP8266WebServer server(80);
+WiFiUDP Udp;
+// Flags for timer
+volatile bool flagTicker50ms = false;
+volatile bool flagTicker1s = false;
+
+// Time digit placeholders for display
+uint8_t sec1, sec2;
+uint8_t min1, min2;
+uint8_t hour1, hour2;
+
+// Reverse display sensor
+bool reverseDisplay = false;   // global flag
+
+// clipping characters
+unsigned short maxPosX = MATRIX_COUNT * 8 - 1;
+
+
+
+
+// --------------------- Settings Structure ---------------------
+struct Settings {
+  int  timeOffset;          // in seconds
+  bool dateScrollEnabled;   // (not used in fixed time mode, but kept for web config)
+  int  brightness;          // 0-15
+  bool displayModeHHMMSS;   // true for HH:MM:SS, false for MM:SS (we use HH:MM:SS here)
+  bool useRTC;
+} settings;
+
+#define EEPROM_SIZE    512
+#define EEPROM_MAGIC   0xABCD
+
+char ssid[32] = "";
+char pass[32] = "";
+
+// --------------------- RTC Definitions ---------------------
+#define DS3231_ADDRESS  0x68
+#define secondREG       0x00
+#define minuteREG       0x01
+#define hourREG         0x02
+#define dayOfWeekREG    0x03
+#define dateREG         0x04
+#define monthREG        0x05
+#define yearREG         0x06
+#define controlREG      0x0E
+
+uint8_t dec2bcd(uint8_t x) { return ((x / 10) << 4) | (x % 10); }
+uint8_t bcd2dec(uint8_t x) { return ((x >> 4) * 10) + (x & 0x0F); }
+
+uint8_t rtcRead(uint8_t regaddr) {
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write(regaddr);
+  Wire.endTransmission();
+  Wire.requestFrom((int)DS3231_ADDRESS, 1);
+  return Wire.read();
+}
+void rtcWrite(uint8_t regaddr, uint8_t val) {
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write(regaddr);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+// --------------------- Current Time Structure ---------------------
+struct DateTime {
+  uint8_t sec1,  sec2,  sec12;
+  uint8_t min1,  min2,  min12;
+  uint8_t hour1, hour2, hour12;
+  uint8_t day1,  day2,  day12;
+  uint8_t month1, month2, month12;
+  uint8_t year1,  year2, year12;
+  uint8_t dayOfWeek;
+} currentTime;
+
+// --------------------- LED Matrix Buffers ---------------------
+uint16_t LEDMatrix[MATRIX_COUNT][8];
+uint16_t helperArrayMAX[MATRIX_COUNT * 8];
+uint16_t helperArrayPos[MATRIX_COUNT * 8];
+
+// --------------------- UDP / NTP Settings ---------------------
+IPAddress timeServerIP;
+const char* ntpServerName = "pool.ntp.org";
+const int   NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+unsigned long epoch = 0;
+unsigned int localPort = 1245;  // UDP port for Clock8001
+
+tm* tt = nullptr;
+
+// --------------------- Scrolling Text (for IP display) ---------------------
+unsigned long lastScrollTime = 0;
+const unsigned long scrollDelay = 100; // ms
+int scrollIndex = 0;
+char scrollContent[256];
+int scrollContentLength = 0;
+bool isScrolling = false;
+
+// --------------------- Font Definitions ---------------------
+// Font1 array (full array for characters 0x20 - 0x7F)
+// For brevity, only digits and colon are required for time display.
+// (You can replace these with your full font arrays if desired.)
+// Font Definitions
+// Font1
+unsigned short const font1[96][9] = { { 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00 },   // 0x20, Space
+        { 0x07, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x00 },   // 0x21, !
+        { 0x07, 0x09, 0x09, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x22, "
+        { 0x07, 0x0a, 0x0a, 0x1f, 0x0a, 0x1f, 0x0a, 0x0a, 0x00 },   // 0x23, #
+        { 0x07, 0x04, 0x0f, 0x14, 0x0e, 0x05, 0x1e, 0x04, 0x00 },   // 0x24, $
+        { 0x07, 0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13, 0x00 },   // 0x25, %
+        { 0x07, 0x04, 0x0a, 0x0a, 0x0a, 0x15, 0x12, 0x0d, 0x00 },   // 0x26, &
+        { 0x07, 0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x27, '
+        { 0x07, 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02, 0x00 },   // 0x28, (
+        { 0x07, 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08, 0x00 },   // 0x29, )
+        { 0x07, 0x04, 0x15, 0x0e, 0x1f, 0x0e, 0x15, 0x04, 0x00 },   // 0x2a, *
+        { 0x07, 0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00, 0x00 },   // 0x2b, +
+        { 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02 },   // 0x2c, ,
+        { 0x07, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00 },   // 0x2d, -
+        { 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x00 },   // 0x2e, .
+        { 0x07, 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10, 0x00 },   // 0x2f, /
+        { 0x07, 0x0F, 0x09, 0x09, 0x09, 0x09, 0x09, 0x0F, 0x00 },   // 0x30, 0
+        { 0x07, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x00 },   // 0x31, 1
+        { 0x07, 0x0F, 0x01, 0x01, 0x0F, 0x08, 0x08, 0x0F, 0x00 },   // 0x32, 2
+        { 0x07, 0x0F, 0x01, 0x01, 0x0F, 0x01, 0x01, 0x0F, 0x00 },   // 0x33, 3
+        { 0x07, 0x09, 0x09, 0x09, 0x0F, 0x01, 0x01, 0x01, 0x00 },   // 0x34, 4
+        { 0x07, 0x0F, 0x08, 0x08, 0x0F, 0x01, 0x01, 0x0F, 0x00 },   // 0x35, 5
+        { 0x07, 0x0F, 0x08, 0x08, 0x0F, 0x09, 0x09, 0x0F, 0x00 },   // 0x36, 6
+        { 0x07, 0x0F, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00 },   // 0x37, 7
+        { 0x07, 0x0F, 0x09, 0x09, 0x0F, 0x09, 0x09, 0x0F, 0x00 },   // 0x38, 8
+        { 0x07, 0x0F, 0x09, 0x09, 0x0F, 0x01, 0x01, 0x0F, 0x00 },   // 0x39, 9
+        { 0x04, 0x00, 0x01, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00 },   // 0x3a, :
+        { 0x07, 0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x04, 0x08, 0x00 },   // 0x3b, ;
+        { 0x07, 0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02, 0x00 },   // 0x3c, <
+        { 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x3d, =
+        { 0x07, 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08, 0x00 },   // 0x3e, >
+        { 0x07, 0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04, 0x00 },   // 0x3f, ?
+        { 0x07, 0x0e, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0f, 0x00 },   // 0x40, @
+        { 0x07, 0x04, 0x0a, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x00 },   // 0x41, A
+        { 0x07, 0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e, 0x00 },   // 0x42, B
+        { 0x07, 0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e, 0x00 },   // 0x43, C
+        { 0x07, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E, 0x00 },   // 0x44, D
+        { 0x07, 0x1f, 0x10, 0x10, 0x1c, 0x10, 0x10, 0x1f, 0x00 },   // 0x45, E
+        { 0x07, 0x1f, 0x10, 0x10, 0x1f, 0x10, 0x10, 0x10, 0x00 },   // 0x46, F
+        { 0x07, 0x0e, 0x11, 0x10, 0x10, 0x13, 0x11, 0x0f, 0x00 },   // 0x37, G
+        { 0x07, 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11, 0x00 },   // 0x48, H
+        { 0x07, 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e, 0x00 },   // 0x49, I
+        { 0x07, 0x1f, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c, 0x00 },   // 0x4a, J
+        { 0x07, 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11, 0x00 },   // 0x4b, K
+        { 0x07, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f, 0x00 },   // 0x4c, L
+        { 0x07, 0x11, 0x1b, 0x15, 0x11, 0x11, 0x11, 0x11, 0x00 },   // 0x4d, M
+        { 0x07, 0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x00 },   // 0x4e, N
+        { 0x07, 0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e, 0x00 },   // 0x4f, O
+        { 0x07, 0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10, 0x00 },   // 0x50, P
+        { 0x07, 0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d, 0x00 },   // 0x51, Q
+        { 0x07, 0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11, 0x00 },   // 0x52, R
+        { 0x07, 0x0e, 0x11, 0x10, 0x0e, 0x01, 0x11, 0x0e, 0x00 },   // 0x53, S
+        { 0x07, 0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00 },   // 0x54, T
+        { 0x07, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e, 0x00 },   // 0x55, U
+        { 0x07, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04, 0x00 },   // 0x56, V
+        { 0x07, 0x11, 0x11, 0x11, 0x15, 0x15, 0x1b, 0x11, 0x00 },   // 0x57, W
+        { 0x07, 0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11, 0x00 },   // 0x58, X
+        { 0x07, 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04, 0x00 },   // 0x59, Y
+        { 0x07, 0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f, 0x00 },   // 0x5a, Z
+        { 0x07, 0x0e, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0e, 0x00 },   // 0x5b, [
+        { 0x07, 0x10, 0x10, 0x08, 0x04, 0x02, 0x01, 0x01, 0x00 },   // 0x5c, '\'
+        { 0x07, 0x0e, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0e, 0x00 },   // 0x5d, ]
+        { 0x07, 0x04, 0x0a, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x5e, ^
+        { 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00 },   // 0x5f, _
+        { 0x07, 0x04, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x60, 
+        { 0x07, 0x00, 0x0e, 0x01, 0x0d, 0x13, 0x13, 0x0d, 0x00 },   // 0x61, a
+        { 0x07, 0x10, 0x10, 0x10, 0x1c, 0x12, 0x12, 0x1c, 0x00 },   // 0x62, b
+        { 0x07, 0x00, 0x00, 0x0E, 0x10, 0x10, 0x10, 0x0E, 0x00 },   // 0x63, c
+        { 0x07, 0x01, 0x01, 0x01, 0x07, 0x09, 0x09, 0x07, 0x00 },   // 0x64, d
+        { 0x07, 0x00, 0x00, 0x0e, 0x11, 0x1f, 0x10, 0x0f, 0x00 },   // 0x65, e
+        { 0x07, 0x06, 0x09, 0x08, 0x1c, 0x08, 0x08, 0x08, 0x00 },   // 0x66, f
+        { 0x07, 0x00, 0x0e, 0x11, 0x13, 0x0d, 0x01, 0x01, 0x0e },   // 0x67, g
+        { 0x07, 0x10, 0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x00 },   // 0x68, h
+        { 0x05, 0x00, 0x02, 0x00, 0x06, 0x02, 0x02, 0x07, 0x00 },   // 0x69, i
+        { 0x07, 0x00, 0x02, 0x00, 0x06, 0x02, 0x02, 0x12, 0x0c },   // 0x6a, j
+        { 0x07, 0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12, 0x00 },   // 0x6b, k
+        { 0x05, 0x06, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x00 },   // 0x6c, l
+        { 0x07, 0x00, 0x00, 0x0a, 0x15, 0x15, 0x11, 0x11, 0x00 },   // 0x6d, m
+        { 0x07, 0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11, 0x00 },   // 0x6e, n
+        { 0x07, 0x00, 0x00, 0x0e, 0x11, 0x11, 0x11, 0x0e, 0x00 },   // 0x6f, o
+        { 0x07, 0x00, 0x00, 0x1c, 0x12, 0x12, 0x1c, 0x10, 0x10 },   // 0x70, p
+        { 0x07, 0x00, 0x00, 0x07, 0x09, 0x09, 0x07, 0x01, 0x01 },   // 0x71, q
+        { 0x07, 0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x00 },   // 0x72, r
+        { 0x07, 0x00, 0x00, 0x0f, 0x10, 0x0e, 0x01, 0x1e, 0x00 },   // 0x73, s
+        { 0x07, 0x08, 0x08, 0x1c, 0x08, 0x08, 0x09, 0x06, 0x00 },   // 0x74, t
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0d, 0x00 },   // 0x75, u
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x11, 0x0a, 0x04, 0x00 },   // 0x76, v
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0a, 0x00 },   // 0x77, w
+        { 0x07, 0x00, 0x00, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x00 },   // 0x78, x
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x0f, 0x01, 0x11, 0x0e },   // 0x79, y
+        { 0x07, 0x00, 0x00, 0x1f, 0x02, 0x04, 0x08, 0x1f, 0x00 },   // 0x7a, z
+        { 0x07, 0x06, 0x08, 0x08, 0x10, 0x08, 0x08, 0x06, 0x00 },   // 0x7b, {
+        { 0x07, 0x04, 0x04, 0x04, 0x00, 0x04, 0x04, 0x04, 0x00 },   // 0x7c, |
+        { 0x07, 0x0c, 0x02, 0x02, 0x01, 0x02, 0x02, 0x0c, 0x00 },   // 0x7d, }
+        { 0x07, 0x08, 0x15, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x7e, ~
+        { 0x07, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00 }    // 0x7f, DEL
+};
+
+// Font2
+unsigned short const font2[96][9] = { { 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00 },   // 0x20, Space
+        { 0x07, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x00 },   // 0x21, !
+        { 0x07, 0x09, 0x09, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x22, "
+        { 0x07, 0x0a, 0x0a, 0x1f, 0x0a, 0x1f, 0x0a, 0x0a, 0x00 },   // 0x23, #
+        { 0x07, 0x04, 0x0f, 0x14, 0x0e, 0x05, 0x1e, 0x04, 0x00 },   // 0x24, $
+        { 0x07, 0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13, 0x00 },   // 0x25, %
+        { 0x07, 0x04, 0x0a, 0x0a, 0x0a, 0x15, 0x12, 0x0d, 0x00 },   // 0x26, &
+        { 0x07, 0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x27, '
+        { 0x07, 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02, 0x00 },   // 0x28, (
+        { 0x07, 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08, 0x00 },   // 0x29, )
+        { 0x07, 0x04, 0x15, 0x0e, 0x1f, 0x0e, 0x15, 0x04, 0x00 },   // 0x2a, *
+        { 0x07, 0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00, 0x00 },   // 0x2b, +
+        { 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02 },   // 0x2c, ,
+        { 0x07, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00 },   // 0x2d, -
+        { 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x00 },   // 0x2e, .
+        { 0x07, 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10, 0x00 },   // 0x2f, /
+        { 0x07, 0x00, 0x00, 0x07, 0x05, 0x05, 0x05, 0x07, 0x00 },   // 0x30, 0
+        { 0x07, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x00 },   // 0x31, 1
+        { 0x07, 0x00, 0x00, 0x07, 0x01, 0x07, 0x04, 0x07, 0x00 },   // 0x32, 2
+        { 0x07, 0x00, 0x00, 0x07, 0x01, 0x07, 0x01, 0x07, 0x00 },   // 0x33, 3
+        { 0x07, 0x00, 0x00, 0x05, 0x05, 0x07, 0x01, 0x01, 0x00 },   // 0x34, 4
+        { 0x07, 0x00, 0x00, 0x07, 0x04, 0x07, 0x01, 0x07, 0x00 },   // 0x35, 5
+        { 0x07, 0x00, 0x00, 0x07, 0x04, 0x07, 0x05, 0x07, 0x00 },   // 0x36, 6
+        { 0x07, 0x00, 0x00, 0x07, 0x01, 0x01, 0x01, 0x01, 0x00 },   // 0x37, 7
+        { 0x07, 0x00, 0x00, 0x07, 0x05, 0x07, 0x05, 0x07, 0x00 },   // 0x38, 8
+        { 0x07, 0x00, 0x00, 0x07, 0x05, 0x07, 0x01, 0x07, 0x00 },   // 0x39, 9
+        { 0x04, 0x00, 0x03, 0x03, 0x00, 0x03, 0x03, 0x00, 0x00 },   // 0x3a, :
+        { 0x07, 0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x04, 0x08, 0x00 },   // 0x3b, ;
+        { 0x07, 0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02, 0x00 },   // 0x3c, <
+        { 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x3d, =
+        { 0x07, 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08, 0x00 },   // 0x3e, >
+        { 0x07, 0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04, 0x00 },   // 0x3f, ?
+        { 0x07, 0x0e, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0f, 0x00 },   // 0x40, @
+        { 0x07, 0x04, 0x0a, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x00 },   // 0x41, A
+        { 0x07, 0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e, 0x00 },   // 0x42, B
+        { 0x07, 0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e, 0x00 },   // 0x43, C
+        { 0x07, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E, 0x00 },   // 0x44, D
+        { 0x07, 0x1f, 0x10, 0x10, 0x1c, 0x10, 0x10, 0x1f, 0x00 },   // 0x45, E
+        { 0x07, 0x1f, 0x10, 0x10, 0x1f, 0x10, 0x10, 0x10, 0x00 },   // 0x46, F
+        { 0x07, 0x0e, 0x11, 0x10, 0x10, 0x13, 0x11, 0x0f, 0x00 },   // 0x37, G
+        { 0x07, 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11, 0x00 },   // 0x48, H
+        { 0x07, 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e, 0x00 },   // 0x49, I
+        { 0x07, 0x1f, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c, 0x00 },   // 0x4a, J
+        { 0x07, 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11, 0x00 },   // 0x4b, K
+        { 0x07, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f, 0x00 },   // 0x4c, L
+        { 0x07, 0x11, 0x1b, 0x15, 0x11, 0x11, 0x11, 0x11, 0x00 },   // 0x4d, M
+        { 0x07, 0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x00 },   // 0x4e, N
+        { 0x07, 0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e, 0x00 },   // 0x4f, O
+        { 0x07, 0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10, 0x00 },   // 0x50, P
+        { 0x07, 0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d, 0x00 },   // 0x51, Q
+        { 0x07, 0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11, 0x00 },   // 0x52, R
+        { 0x07, 0x0e, 0x11, 0x10, 0x0e, 0x01, 0x11, 0x0e, 0x00 },   // 0x53, S
+        { 0x07, 0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00 },   // 0x54, T
+        { 0x07, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e, 0x00 },   // 0x55, U
+        { 0x07, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04, 0x00 },   // 0x56, V
+        { 0x07, 0x11, 0x11, 0x11, 0x15, 0x15, 0x1b, 0x11, 0x00 },   // 0x57, W
+        { 0x07, 0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11, 0x00 },   // 0x58, X
+        { 0x07, 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04, 0x00 },   // 0x59, Y
+        { 0x07, 0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f, 0x00 },   // 0x5a, Z
+        { 0x07, 0x0e, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0e, 0x00 },   // 0x5b, [
+        { 0x07, 0x10, 0x10, 0x08, 0x04, 0x02, 0x01, 0x01, 0x00 },   // 0x5c, '\'
+        { 0x07, 0x0e, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0e, 0x00 },   // 0x5d, ]
+        { 0x07, 0x04, 0x0a, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x5e, ^
+        { 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00 },   // 0x5f, _
+        { 0x07, 0x04, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x60, 
+        { 0x07, 0x00, 0x0e, 0x01, 0x0d, 0x13, 0x13, 0x0d, 0x00 },   // 0x61, a
+        { 0x07, 0x10, 0x10, 0x10, 0x1c, 0x12, 0x12, 0x1c, 0x00 },   // 0x62, b
+        { 0x07, 0x00, 0x00, 0x0E, 0x10, 0x10, 0x10, 0x0E, 0x00 },   // 0x63, c
+        { 0x07, 0x01, 0x01, 0x01, 0x07, 0x09, 0x09, 0x07, 0x00 },   // 0x64, d
+        { 0x07, 0x00, 0x00, 0x0e, 0x11, 0x1f, 0x10, 0x0f, 0x00 },   // 0x65, e
+        { 0x07, 0x06, 0x09, 0x08, 0x1c, 0x08, 0x08, 0x08, 0x00 },   // 0x66, f
+        { 0x07, 0x00, 0x0e, 0x11, 0x13, 0x0d, 0x01, 0x01, 0x0e },   // 0x67, g
+        { 0x07, 0x10, 0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x00 },   // 0x68, h
+        { 0x05, 0x00, 0x02, 0x00, 0x06, 0x02, 0x02, 0x07, 0x00 },   // 0x69, i
+        { 0x07, 0x00, 0x02, 0x00, 0x06, 0x02, 0x02, 0x12, 0x0c },   // 0x6a, j
+        { 0x07, 0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12, 0x00 },   // 0x6b, k
+        { 0x05, 0x06, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x00 },   // 0x6c, l
+        { 0x07, 0x00, 0x00, 0x0a, 0x15, 0x15, 0x11, 0x11, 0x00 },   // 0x6d, m
+        { 0x07, 0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11, 0x00 },   // 0x6e, n
+        { 0x07, 0x00, 0x00, 0x0e, 0x11, 0x11, 0x11, 0x0e, 0x00 },   // 0x6f, o
+        { 0x07, 0x00, 0x00, 0x1c, 0x12, 0x12, 0x1c, 0x10, 0x10 },   // 0x70, p
+        { 0x07, 0x00, 0x00, 0x07, 0x09, 0x09, 0x07, 0x01, 0x01 },   // 0x71, q
+        { 0x07, 0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x00 },   // 0x72, r
+        { 0x07, 0x00, 0x00, 0x0f, 0x10, 0x0e, 0x01, 0x1e, 0x00 },   // 0x73, s
+        { 0x07, 0x08, 0x08, 0x1c, 0x08, 0x08, 0x09, 0x06, 0x00 },   // 0x74, t
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0d, 0x00 },   // 0x75, u
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x11, 0x0a, 0x04, 0x00 },   // 0x76, v
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0a, 0x00 },   // 0x77, w
+        { 0x07, 0x00, 0x00, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x00 },   // 0x78, x
+        { 0x07, 0x00, 0x00, 0x11, 0x11, 0x0f, 0x01, 0x11, 0x0e },   // 0x79, y
+        { 0x07, 0x00, 0x00, 0x1f, 0x02, 0x04, 0x08, 0x1f, 0x00 },   // 0x7a, z
+        { 0x07, 0x06, 0x08, 0x08, 0x10, 0x08, 0x08, 0x06, 0x00 },   // 0x7b, {
+        { 0x07, 0x04, 0x04, 0x04, 0x00, 0x04, 0x04, 0x04, 0x00 },   // 0x7c, |
+        { 0x07, 0x0c, 0x02, 0x02, 0x01, 0x02, 0x02, 0x0c, 0x00 },   // 0x7d, }
+        { 0x07, 0x08, 0x15, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 0x7e, ~
+        { 0x07, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00 }    // 0x7f, DEL
+};
+
+// --------------------- MAX7219 Initialization Data ---------------------
+const byte InitArray[7][2] = {
+  {0x0F, 0x00},  // Display test: off
+  {0x0C, 0x01},  // Normal operation (shutdown register)
+  {0x0B, 0x07},  // Scan limit: display all 8 columns
+  {0x0A, 0x02},  // Intensity (default brightness 2)
+  {0x09, 0x00},  // Decode mode: off
+  {0x01, 0x00},  // Clear digit 0
+  {0x02, 0x00}   // Clear digit 1
+};
+
+// --------------------- Function Prototypes ---------------------
+void saveSettings();
+void loadSettings();
+void setupWiFi();
+void enterAPMode();
+void startWebServer();
+void handleRoot();
+void handleSaveSettings();
+void handleNotFound();
+void timer50ms();
+tm* connectNTP();
+void rtcSet(tm* t);
+void rtcToTime();
+void clear_Display();
+void refresh_display();
+void max7219_init();
+void max7219_set_brightness(uint8_t br);
+void helperArray_init();
+void charToMatrix(unsigned short ch, int PosX, short PosY);
+void charToMatrix2(unsigned short ch, int PosX, short PosY);
+void scrollText(const char* text);
+void handleScrolling();
+void handleClock8001Packet(const char* packet);
+
+// --------------------- EEPROM Settings ---------------------
+void loadSettings() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint16_t magic;
+  EEPROM.get(0, magic);
+  if (magic != EEPROM_MAGIC) {
+    Serial.println("EEPROM not init. Setting defaults.");
+    settings.timeOffset = 0;
+    settings.dateScrollEnabled = true;
+    settings.brightness = 2; // default brightness
+    settings.displayModeHHMMSS = true;
+    settings.useRTC = true; // default to true
+    strcpy(ssid, "");
+    strcpy(pass, "");
+    saveSettings();
+  } else {
+    EEPROM.get(sizeof(uint16_t), settings);
+    EEPROM.get(sizeof(uint16_t)+sizeof(settings), ssid);
+    EEPROM.get(sizeof(uint16_t)+sizeof(settings)+sizeof(ssid), pass);
+    Serial.println("Settings loaded from EEPROM.");
+  }
+  EEPROM.end();
+}
+
+void saveSettings() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint16_t magic = EEPROM_MAGIC;
+  EEPROM.put(0, magic);
+  EEPROM.put(sizeof(uint16_t), settings);
+  EEPROM.put(sizeof(uint16_t)+sizeof(settings), ssid);
+  EEPROM.put(sizeof(uint16_t)+sizeof(settings)+sizeof(ssid), pass);
+  EEPROM.commit();
+  EEPROM.end();
+  Serial.println("Settings saved.");
+}
+
+// --------------------- RTC Functions ---------------------
+void rtcSet(tm* t) {
+  if (settings.useRTC) {
+  rtcWrite(secondREG, dec2bcd(t->tm_sec));
+  rtcWrite(minuteREG, dec2bcd(t->tm_min));
+  rtcWrite(hourREG,   dec2bcd(t->tm_hour));
+  rtcWrite(dayOfWeekREG, (uint8_t)(t->tm_wday == 0 ? 7 : t->tm_wday));
+  rtcWrite(dateREG,  dec2bcd(t->tm_mday));
+  rtcWrite(monthREG, dec2bcd(t->tm_mon + 1));
+  rtcWrite(yearREG,  dec2bcd(t->tm_year - 100));
+  Serial.println("RTC updated.");
+  }
+}
+
+void rtcToTime() {
+  if (settings.useRTC) {
+  uint8_t s  = bcd2dec(rtcRead(secondREG));
+  uint8_t m  = bcd2dec(rtcRead(minuteREG));
+  uint8_t h  = bcd2dec(rtcRead(hourREG));
+  uint8_t d  = bcd2dec(rtcRead(dateREG));
+  uint8_t mo = bcd2dec(rtcRead(monthREG));
+  uint8_t y  = bcd2dec(rtcRead(yearREG));
+  uint8_t dw = rtcRead(dayOfWeekREG);
+  if (dw == 7) dw = 0; // convert DS3231 Sunday=7 to 0
+
+  currentTime.sec12 = s;
+  currentTime.sec1  = s % 10;
+  currentTime.sec2  = s / 10;
+  currentTime.min12 = m;
+  currentTime.min1  = m % 10;
+  currentTime.min2  = m / 10;
+  currentTime.hour12= h;
+  currentTime.hour1 = h % 10;
+  currentTime.hour2 = h / 10;
+  currentTime.day12 = d;
+  currentTime.day1  = d % 10;
+  currentTime.day2  = d / 10;
+  currentTime.month12 = mo;
+  currentTime.month1  = mo % 10;
+  currentTime.month2  = mo / 10;
+  currentTime.year12  = y;
+  currentTime.year1   = y % 10;
+  currentTime.year2   = y / 10;
+  currentTime.dayOfWeek = dw;
+  }
+}
+
+// --------------------- NTP Function ---------------------
+tm* connectNTP() {
+  WiFi.hostByName(ntpServerName, timeServerIP);
+  Serial.print("NTP Server IP: ");
+  Serial.println(timeServerIP);
+
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;
+  packetBuffer[1] = 0;
+  packetBuffer[2] = 6;
+  packetBuffer[3] = 0xEC;
+  packetBuffer[12]= 49;
+  packetBuffer[13]= 0x4E;
+  packetBuffer[14]= 49;
+  packetBuffer[15]= 52;
+
+  Udp.beginPacket(timeServerIP, 123);
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+  delay(1000);
+
+  int cb = Udp.parsePacket();
+  if (cb == 0) return nullptr;
+  Udp.read(packetBuffer, NTP_PACKET_SIZE);
+  unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+  unsigned long lowWord  = word(packetBuffer[42], packetBuffer[43]);
+  unsigned long secsSince1900 = ((unsigned long)highWord << 16) | lowWord;
+  const unsigned long seventyYears = 2208988800UL;
+  epoch = secsSince1900 - seventyYears + settings.timeOffset;
+
+  time_t t = epoch;
+  tm* tmPtr = localtime(&t);
+  Serial.printf("NTP epoch: %lu\n", epoch);
+  Serial.println(asctime(tmPtr));
+  return tmPtr;
+}
+
+// --------------------- MAX7219 / LED Matrix Functions ---------------------
+void helperArray_init() {
+  uint16_t j = 0, k = 0;
+  for (uint16_t i = 0; i < MATRIX_COUNT * 8; i++) {
+    helperArrayPos[i] = (1 << j);
+    helperArrayMAX[i] = k;
+    j++;
+    if (j > 7) { j = 0; k++; }
+  }
+}
+
+void max7219_init() {
+  // Loop exactly 7 times, per our InitArray
+  for (uint8_t i = 0; i < 7; i++) {
+    digitalWrite(CS_PIN, LOW);
+    delayMicroseconds(1);
+    for (uint8_t j = 0; j < MATRIX_COUNT; j++) {
+      SPI.write(InitArray[i][0]);
+      SPI.write(InitArray[i][1]);
+    }
+    digitalWrite(CS_PIN, HIGH);
+  }
+  Serial.println("MAX7219 modules initialized.");
+}
+
+void max7219_set_brightness(uint8_t br) {
+  if (br > 15) br = 15;
+  digitalWrite(CS_PIN, LOW);
+  delayMicroseconds(1);
+  for (uint8_t j = 0; j < MATRIX_COUNT; j++) {
+    SPI.write(0x0A); // Intensity register
+    SPI.write(br);
+  }
+  digitalWrite(CS_PIN, HIGH);
+  Serial.print("Brightness set to: ");
+  Serial.println(br);
+}
+
+void clear_Display() {
+  for (uint8_t row = 0; row < 8; row++) {
+    digitalWrite(CS_PIN, LOW);
+    delayMicroseconds(1);
+    for (uint8_t j = 0; j < MATRIX_COUNT; j++) {
+      LEDMatrix[j][row] = 0;
+      SPI.write(row + 1);
+      SPI.write(0x00);
+    }
+    digitalWrite(CS_PIN, HIGH);
+  }
+}
+
+void refresh_display() {
+  for (uint8_t row = 0; row < 8; row++) {
+    digitalWrite(CS_PIN, LOW);
+    delayMicroseconds(1);
+
+    for (uint8_t j = 0; j < MATRIX_COUNT; j++) {
+      SPI.write(row + 1);
+
+      if (reverseDisplay) {
+        // Reverse orientation:  invert the module index and row.
+        // The older code sometimes used SPI.setBitOrder(LSBFIRST) to reverse columns.
+        // Example approach: write from the "opposite" module [MATRIX_COUNT-1-j], and from row = 7 - row
+        SPI.setBitOrder(LSBFIRST);
+        SPI.write( LEDMatrix[MATRIX_COUNT - 1 - j][7 - row] & 0xFF );
+        SPI.setBitOrder(MSBFIRST);
+      }
+      else {
+        // Normal orientation
+        SPI.write( LEDMatrix[j][row] & 0xFF );
+      }
+    }
+
+    digitalWrite(CS_PIN, HIGH);
+  }
+}
+
+
+// --------------------- Character Drawing Functions ---------------------
+void charToMatrix(unsigned short ch, int PosX, short PosY) {
+  PosX++; // same as before
+  int k = ch - 32;
+  if (k < 0 || k >= 96) return;
+  unsigned short charWidth = font1[k][0];
+  unsigned short mask = 1 << (charWidth - 2);
+
+  for (int i = 0; i < charWidth; i++) {
+    int xTest = PosX - i;
+    if ((xTest <= maxPosX) && (xTest >= 0) && (PosY > -8) && (PosY < 8)) {
+      uint16_t o1 = helperArrayPos[xTest];
+      uint16_t o2 = helperArrayMAX[xTest];
+      for (int row = 0; row < 8; row++) {
+        // if you want that old vertical clipping logic
+        if (((PosY >= 0) && (PosY <= row)) 
+            || ((PosY < 0) && (row < PosY + 8))) {
+          uint16_t l = font1[k][row + 1];
+          uint16_t m = (l & (mask >> i));
+          if (m) LEDMatrix[o2][row - PosY] |= o1;
+          else   LEDMatrix[o2][row - PosY] &= ~o1;
+        }
+      }
+    }
+  }
+}
+
+
+void charToMatrix2(unsigned short ch, int PosX, short PosY) {
+  // Draw using font2.
+  PosX++;
+  int k = ch - 32;
+  if (k < 0 || k >= 96) return;
+  uint16_t charWidth = font2[k][0];
+  uint16_t mask = 1 << (charWidth - 2);
+  for (int i = 0; i < charWidth; i++) {
+    int targetX = PosX - i;
+    if (targetX >= 0 && targetX < MATRIX_COUNT * 8) {
+      uint16_t o1 = helperArrayPos[targetX];
+      uint16_t o2 = helperArrayMAX[targetX];
+      for (int row = 0; row < 8; row++) {
+        uint16_t l = font2[k][row + 1];
+        uint16_t m = (l & (mask >> i));
+        if (m) LEDMatrix[o2][row] |= o1;
+        else   LEDMatrix[o2][row] &= ~o1;
+      }
+    }
+  }
+}
+
+// --------------------- Scrolling Text (for IP display) ---------------------
+void scrollText(const char* text) {
+  strncpy(scrollContent, text, sizeof(scrollContent)-1);
+  scrollContent[sizeof(scrollContent)-1] = '\0';
+  scrollIndex = 0;
+  scrollContentLength = strlen(scrollContent);
+  isScrolling = true;
+  lastScrollTime = millis();
+  Serial.println("Scrolling text: " + String(text));
+}
+
+void handleScrolling() {
+  if (!isScrolling || scrollContentLength == 0) return;
+  unsigned long now = millis();
+  if (now - lastScrollTime >= scrollDelay) {
+    lastScrollTime = now;
+    clear_Display();
+    for (int i = 0; i < scrollContentLength; i++) {
+      // Use font1 to render each character with fixed spacing of 6 pixels.
+      charToMatrix(scrollContent[i], scrollIndex - i * 6, 0);
+    }
+    refresh_display();
+    scrollIndex++;
+    if (scrollIndex > (scrollContentLength * 6 + MATRIX_COUNT * 8)) {
+      scrollIndex = 0;
+      scrollContent[0] = '\0';
+      scrollContentLength = 0;
+      isScrolling = false;
+      clear_Display();
+      refresh_display();
+      Serial.println("Scrolling completed.");
+    }
+  }
+}
+
+// --------------------- UDP Packet Processing ---------------------
+// This function expects UDP packets that contain the text:
+//    /clock/state,issssiHHMMSS
+// It prints the entire packet plus the extracted HHMMSS and updates the RTC.
+void handleClock8001Packet(const char* packet) {
+  const uint8_t* data = (const uint8_t*)packet;
+
+  Serial.print("Received UDP packet: ");
+  for (int i = 0; i < 64; i++) {
+    Serial.print(data[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  const char expectedHeader[] = "/clock/state";
+  if (memcmp(data, expectedHeader, strlen(expectedHeader)) != 0) {
+    Serial.println("Not a Clock8001 packet (no header match).");
+    return;
+  }
+
+  // Step 1: find the first ASCII digit (skip nulls and non-digit chars)
+  int digitStart = 0;
+  for (int i = 0; i < 64; i++) {
+    if (data[i] >= '0' && data[i] <= '9') {
+      digitStart = i;
+      break;
+    }
+  }
+
+  // Step 2: extract 6 digits skipping nulls
+  char digits[7] = {0};
+  int digitIndex = 0;
+  for (int i = digitStart; i < 64 && digitIndex < 6; i++) {
+    if (data[i] >= '0' && data[i] <= '9') {
+      digits[digitIndex++] = data[i];
+    }
+  }
+
+  if (digitIndex != 6) {
+    Serial.println("Failed to extract 6 digits from packet.");
+    return;
+  }
+
+  int hh = (digits[0] - '0') * 10 + (digits[1] - '0');
+  int mm = (digits[2] - '0') * 10 + (digits[3] - '0');
+  int ss = (digits[4] - '0') * 10 + (digits[5] - '0');
+
+  Serial.printf("Parsed Clock8001 time: %02d:%02d:%02d\n", hh, mm, ss);
+
+  rtcToTime();
+  struct tm tStruct;
+  tStruct.tm_year = currentTime.year12 + 100;
+  tStruct.tm_mon  = currentTime.month12 - 1;
+  tStruct.tm_mday = currentTime.day12;
+  tStruct.tm_wday = currentTime.dayOfWeek;
+  tStruct.tm_hour = hh;
+  tStruct.tm_min  = mm;
+  tStruct.tm_sec  = ss;
+
+  rtcSet(&tStruct);
+  rtcToTime();
+}
+
+
+
+// --------------------- Ticker Callback ---------------------
+// Runs every 50 ms; every 20 calls (1 s) sets the 1-second flag.
+void timer50ms() {
+  static unsigned int count = 0;
+  flagTicker50ms = true;
+  count++;
+  if (count == 20) {
+    flagTicker1s = true;
+    count = 0;
+  }
+}
+
+// --------------------- Wi-Fi and AP Setup ---------------------
+void setupWiFi() {
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.mode(WIFI_AP_STA);
+  if (strlen(ssid) == 0) {
+    Serial.println("No Wi-Fi credentials. Entering AP mode.");
+    enterAPMode();
+    return;
+  }
+  WiFi.begin(ssid, pass);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to Wi-Fi.");
+    IPAddress myIP = WiFi.localIP();
+    Serial.print("IP Address: ");
+    Serial.println(myIP);
+    char ipStr[16];
+    sprintf(ipStr, "%d.%d.%d.%d", myIP[0], myIP[1], myIP[2], myIP[3]);
+    scrollText(ipStr);  // Scroll IP address at startup.
+    Udp.begin(localPort);
+    Serial.print("Listening for Clock8001 on UDP port ");
+    Serial.println(localPort);
+    startWebServer();
+  } else {
+    Serial.println("\nFailed to connect. Entering AP mode.");
+    enterAPMode();
+  }
+}
+
+void enterAPMode() {
+  Serial.println("Starting AP mode for configuration.");
+  IPAddress local_IP(192,168,4,1);
+  IPAddress gateway(192,168,4,1);
+  IPAddress subnet(255,255,255,0);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP("MatrixClock_Config");
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.print("AP IP: ");
+  Serial.println(apIP);
+  startWebServer();
+}
+
+// --------------------- Web Server ---------------------
+void startWebServer() {
+  server.on("/", handleRoot);
+  server.on("/save", handleSaveSettings);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+void handleRoot() {
+  Serial.println("Handling root URL.");
+  String html = "<html><head><title>MatrixClock Setup</title></head><body>";
+  html += "<h1>MatrixClock Configuration</h1>";
+  html += "<form action=\"/save\" method=\"POST\">";
+  html += "Wi-Fi SSID: <input type=\"text\" name=\"ssid\" value=\"" + String(ssid) + "\"><br>";
+  html += "Wi-Fi Password: <input type=\"password\" name=\"pass\" placeholder=\"Leave blank to keep current\"><br>";
+  html += "Time Offset Hours: <input type=\"number\" name=\"timeOffsetHours\" value=\"" + String(settings.timeOffset / 3600) + "\"><br>";
+  html += "Time Offset Minutes: <input type=\"number\" name=\"timeOffsetMinutes\" value=\"" + String((settings.timeOffset % 3600) / 60) + "\"><br>";
+  html += "Time Offset Seconds: <input type=\"number\" name=\"timeOffsetSeconds\" value=\"" + String(settings.timeOffset % 60) + "\"><br>";
+  html += "Date Scroll: <input type=\"checkbox\" name=\"dateScroll\"" + String(settings.dateScrollEnabled ? " checked" : "") + "><br>";
+  html += "Brightness (0-15): <input type=\"number\" name=\"brightness\" min=\"0\" max=\"15\" value=\"" + String(settings.brightness) + "\"><br>";
+  html += "Display Mode: <select name=\"displayMode\">";
+  html += "<option value=\"HHMMSS\"" + String(settings.displayModeHHMMSS ? " selected" : "") + ">HH:MM:SS</option>";
+  html += "<option value=\"MMSS\"" + String(!settings.displayModeHHMMSS ? " selected" : "") + ">MM:SS</option>";
+  html += "</select><br>";
+  html += "Use RTC: <input type=\"checkbox\" name=\"useRTC\"" + String(settings.useRTC ? " checked" : "") + "><br>";
+  html += "<input type=\"submit\" value=\"Save Settings\">";
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSaveSettings() {
+  Serial.println("Saving settings...");
+  if (server.hasArg("ssid")) {
+    String newSSID = server.arg("ssid");
+    strncpy(ssid, newSSID.c_str(), sizeof(ssid)-1);
+    ssid[sizeof(ssid)-1] = '\0';
+  }
+  if (server.hasArg("pass") && server.arg("pass").length() > 0) {
+    String newPass = server.arg("pass");
+    strncpy(pass, newPass.c_str(), sizeof(pass)-1);
+    pass[sizeof(pass)-1] = '\0';
+  }
+  if (server.hasArg("timeOffsetHours") && server.hasArg("timeOffsetMinutes") && server.hasArg("timeOffsetSeconds")) {
+    int h = server.arg("timeOffsetHours").toInt();
+    int m = server.arg("timeOffsetMinutes").toInt();
+    int s = server.arg("timeOffsetSeconds").toInt();
+    settings.timeOffset = (h * 3600) + (m * 60) + s;
+  }
+  settings.dateScrollEnabled = server.hasArg("dateScroll");
+  if (server.hasArg("brightness")) {
+    int b = server.arg("brightness").toInt();
+    if (b < 0) b = 0;
+    if (b > 15) b = 15;
+    settings.brightness = b;
+    settings.useRTC = server.hasArg("useRTC");
+  }
+  if (server.hasArg("displayMode")) {
+    String mode = server.arg("displayMode");
+    settings.displayModeHHMMSS = (mode == "HHMMSS");
+  }
+  saveSettings();
+  max7219_set_brightness(settings.brightness);
+  String reply = "<html><head><title>Saved</title></head><body><h1>Settings Saved!</h1><p>Restarting...</p></body></html>";
+  server.send(200, "text/html", reply);
+  delay(2000);
+  ESP.restart();
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "404: Not Found");
+}
+
+// --------------------- Setup ---------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nMatrixClock Starting...");
+
+  pinMode(16, INPUT_PULLUP);  // or however your orientation sensor is wired
+  pinMode(CS_PIN, OUTPUT);
+  digitalWrite(CS_PIN, HIGH);
+  SPI.begin();
+
+  helperArray_init();
+  max7219_init();
+
+  loadSettings();
+  max7219_set_brightness(settings.brightness);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  rtcWrite(controlREG, 0x00); // ensure oscillator is on
+  clear_Display();
+  refresh_display();
+
+  ticker.attach(0.05, timer50ms);
+
+  setupWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    tm* ntpTime = connectNTP();
+    if (ntpTime != nullptr) rtcSet(ntpTime);
+  }
+}
+
+// --------------------- Main Loop ---------------------
+void loop() {
+  yield();
+
+  // Check UDP packets on port 1245
+  int packetSize = Udp.parsePacket();
+  if (packetSize) {
+    char udpBuf[255];
+    int len = Udp.read(udpBuf, 254);
+    if (len > 0) {
+      udpBuf[len] = '\0';
+      handleClock8001Packet(udpBuf);
+    }
+  }
+
+if (settings.useRTC) {
+  rtcToTime();
+
+  // 1-second events (triggered by ticker)
+  if (flagTicker1s) {
+    flagTicker1s = false;
+    sec1  = currentTime.sec12 % 10;
+    sec2  = currentTime.sec12 / 10;
+    min1  = currentTime.min12 % 10;
+    min2  = currentTime.min12 / 10;
+    hour1 = currentTime.hour12 % 10;
+    hour2 = currentTime.hour12 / 10;
+    // flip orientation if pin is low
+    reverseDisplay = !digitalRead(16);
+  }
+}
+  // 50-ms events: update display with fixed positions
+  if (flagTicker50ms) {
+    flagTicker50ms = false;
+    clear_Display();
+
+// Dynamically switch to MM:SS if hour == 0
+bool forceMMSS = (currentTime.hour12 == 0);
+
+  if (settings.displayModeHHMMSS && !forceMMSS) {
+
+    charToMatrix2('0' + sec1, 4, 2);
+    charToMatrix2('0' + sec2, 8, 2);
+    //charToMatrix(':', 10, 0);
+    charToMatrix('0' + min1, 13, 0);
+    charToMatrix('0' + min2, 18, 0);
+    charToMatrix(':', 21, 0);
+    charToMatrix('0' + hour1, 27, 0);
+    charToMatrix('0' + hour2, 32, 0);
+  } else {
+    // MM:SS fallback
+    charToMatrix('0' + sec1, 9, 0);
+    charToMatrix('0' + sec2, 14, 0);
+    charToMatrix(':', 17, 0);
+    charToMatrix('0' + min1, 23, 0);
+    charToMatrix('0' + min2, 28, 0);
+
+  }
+
+  refresh_display();
+}
+
+
+  // Handle scrolling text (e.g. the IP address)
+  handleScrolling();
+
+  // Web server handling
+  server.handleClient();
+  
+  // The ticker callback handles timing.
+}
